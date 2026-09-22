@@ -129,11 +129,14 @@ jobs:
           git push
 
       - name: 跨推到 Gitee（双备份）
-        if: ${{ secrets.GITEE_USER != '' }}
         env:
           GITEE_USER: ${{ secrets.GITEE_USER }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_REPO: ${{ secrets.GITEE_REPO }}
         run: |
-          git remote add gitee https://${{ secrets.GITEE_TOKEN }}@gitee.com/${{ secrets.GITEE_USER }}/${{ secrets.GITEE_REPO }}.git
-          git push gitee HEAD:master --force
+          if [ -z "$GITEE_USER" ] || [ -z "$GITEE_TOKEN" ] || [ -z "$GITEE_REPO" ]; then
+            echo "未配置 Gitee Secrets，跳过双备份（不影响主流程，GitHub 上的 dlt.csv 已更新）"
+            exit 0
+          fi
+          git remote add gitee "https://$GITEE_TOKEN@gitee.com/$GITEE_USER/$GITEE_REPO.git"
+          git push gitee "HEAD:master" --force
