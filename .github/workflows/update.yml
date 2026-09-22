@@ -14,6 +14,10 @@ on:
     - cron: "30 22 * * *"   # 每天 UTC 22:30 ≈ 北京时间 06:30（开奖后）
   workflow_dispatch:
 
+# 关键：允许工作流把更新后的数据 push 回仓库（新仓库默认只读，缺这句必失败）
+permissions:
+  contents: write
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -26,7 +30,7 @@ jobs:
       - name: 抓取体彩官网并转为 CSV（失败自动回退 17500）
         run: |
           python3 - <<'PY'
-          import json, urllib.request, csv
+          import json, urllib.request, csv, time, sys
 
           HDR = {
               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -49,43 +53,62 @@ jobs:
               return p.get('stakeCount', ''), num(p.get('stakeAmount'))
 
           rows = []
-          try:
-              page = 1
-              while True:
-                  url = ('https://webapi.sporttery.cn/gateway/lottery/getHistoryPageListV1.qry'
-                         '?gameNo=85&provinceId=0&pageSize=100&isVerify=1&pageNo=%d' % page)
-                  req = urllib.request.Request(url, headers=HDR)
-                  data = json.load(urllib.request.urlopen(req, timeout=30))
-                  lst = data.get('value', {}).get('list', [])
-                  if not lst:
+
+          # ---------- 来源 1：体彩官网（重试 3 次） ----------
+          for attempt in range(3):
+              try:
+                  page = 1
+                  while True:
+                      url = ('https://webapi.sporttery.cn/gateway/lottery/getHistoryPageListV1.qry'
+                             '?gameNo=85&provinceId=0&pageSize=100&isVerify=1&pageNo=%d' % page)
+                      req = urllib.request.Request(url, headers=HDR)
+                      data = json.load(urllib.request.urlopen(req, timeout=30))
+                      lst = data.get('value', {}).get('list', [])
+                      if not lst:
+                          break
+                      for r in lst:
+                          res = r['lotteryDrawResult'].split()
+                          uns = r.get('lotteryUnsortDrawresult', '').split()
+                          front = res[:5]
+                          back = res[5:7]
+                          fd = (uns[:5] + [''] * 5)[:5]      # 前区出球顺序
+                          bd = (uns[5:7] + [''] * 2)[:2]     # 后区出球顺序
+                          pool = num(r.get('poolBalanceAfterdraw'))
+                          sale = num(r.get('totalSaleAmount'))
+                          pl = {p['prizeLevel']: p for p in r.get('prizeLevelList', [])}
+                          y1c, y1a = priz(pl, '一等奖')
+                          y2c, y2a = priz(pl, '二等奖')
+                          rows.append([r['lotteryDrawNum'], r['lotteryDrawTime']] + front + back + bd + fd +
+                                      [pool, sale, y1c, y1a, y2c, y2a])
+                      print('  已抓取第 %d 页，累计 %d 期' % (page, len(rows)))
+                      if len(lst) < 100:
+                          break
+                      page += 1
+                  print('体彩官网抓取成功，共 %d 期' % len(rows))
+                  break
+              except Exception as e:
+                  rows = []
+                  print('体彩官网第 %d 次尝试失败：' % (attempt + 1), e)
+                  time.sleep(3)
+
+          # ---------- 来源 2：兜底 17500.cn ----------
+          if not rows:
+              for u in ('https://data.17500.cn/dlt_desc.txt', 'http://data.17500.cn/dlt_desc.txt'):
+                  try:
+                      txt = urllib.request.urlopen(u, timeout=30).read().decode('utf-8')
+                      for line in txt.strip().splitlines():
+                          t = line.split()
+                          if len(t) < 22:
+                              continue
+                          rows.append([x if x != '-' else '' for x in t[:22]])
+                      print('兜底 17500 成功，共 %d 期' % len(rows))
                       break
-                  for r in lst:
-                      res = r['lotteryDrawResult'].split()
-                      uns = r.get('lotteryUnsortDrawresult', '').split()
-                      front = res[:5]
-                      back = res[5:7]
-                      fd = (uns[:5] + [''] * 5)[:5]      # 前区出球顺序
-                      bd = (uns[5:7] + [''] * 2)[:2]     # 后区出球顺序
-                      pool = num(r.get('poolBalanceAfterdraw'))
-                      sale = num(r.get('totalSaleAmount'))
-                      pl = {p['prizeLevel']: p for p in r.get('prizeLevelList', [])}
-                      y1c, y1a = priz(pl, '一等奖')
-                      y2c, y2a = priz(pl, '二等奖')
-                      rows.append([r['lotteryDrawNum'], r['lotteryDrawTime']] + front + back + bd + fd +
-                                  [pool, sale, y1c, y1a, y2c, y2a])
-                  if len(lst) < 100:
-                      break
-                  page += 1
-              print('体彩官网抓取成功，共 %d 期' % len(rows))
-          except Exception as e:
-              print('体彩官网接口失败，回退 17500：', e)
-              import urllib.request as u
-              txt = u.urlopen('http://data.17500.cn/dlt_desc.txt', timeout=30).read().decode('utf-8')
-              for line in txt.strip().splitlines():
-                  t = line.split()
-                  if len(t) < 22:
-                      continue
-                  rows.append([x if x != '-' else '' for x in t[:22]])
+                  except Exception as e:
+                      print('兜底 %s 失败：' % u, e)
+
+          if not rows:
+              print('错误：两个数据源都失败了，请打开 GitHub Actions 运行日志查看上方具体报错。')
+              sys.exit(1)
 
           with open('dlt.csv', 'w', newline='', encoding='utf-8') as f:
               w = csv.writer(f)
@@ -106,7 +129,7 @@ jobs:
           git push
 
       - name: 跨推到 Gitee（双备份）
-        if: ${{ env.GITEE_USER != '' }}
+        if: ${{ secrets.GITEE_USER != '' }}
         env:
           GITEE_USER: ${{ secrets.GITEE_USER }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
