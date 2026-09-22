@@ -1,0 +1,116 @@
+# ============================================================
+# 文件名：github-actions-update.yml
+# 数据源：中国体彩官网（webapi.sporttery.cn，与 lottery.gov.cn 同源）
+#       官方接口若被反爬拦截，自动回退到 17500.cn 兜底，保证不断更。
+# 产出：dlt.csv（22 列，与你 Excel 模板一一对应）
+# 用途：每天自动抓取 → 提交 GitHub → 自动跨推 Gitee（双备份）
+# 用法：把本文件内容原样复制到仓库的  .github/workflows/update.yml
+# ============================================================
+
+name: 每日更新大乐透数据
+
+on:
+  schedule:
+    - cron: "30 22 * * *"   # 每天 UTC 22:30 ≈ 北京时间 06:30（开奖后）
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载仓库代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 抓取体彩官网并转为 CSV（失败自动回退 17500）
+        run: |
+          python3 - <<'PY'
+          import json, urllib.request, csv
+
+          HDR = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Accept': 'application/json, text/javascript, */*; q=0.01',
+              'sec-ch-ua': '"Chromium";v="120", "Not?A_Brand";v="24"',
+              'sec-ch-ua-mobile': '?0',
+              'Sec-Fetch-Dest': 'empty',
+              'Sec-Fetch-Mode': 'cors',
+              'Sec-Fetch-Site': 'same-site',
+              'Referer': 'https://www.lottery.gov.cn/',
+          }
+
+          def num(x):
+              return (x or '').replace(',', '').replace('---', '').strip()
+
+          def priz(pl, name):
+              p = pl.get(name)
+              if not p:
+                  return '', ''
+              return p.get('stakeCount', ''), num(p.get('stakeAmount'))
+
+          rows = []
+          try:
+              page = 1
+              while True:
+                  url = ('https://webapi.sporttery.cn/gateway/lottery/getHistoryPageListV1.qry'
+                         '?gameNo=85&provinceId=0&pageSize=100&isVerify=1&pageNo=%d' % page)
+                  req = urllib.request.Request(url, headers=HDR)
+                  data = json.load(urllib.request.urlopen(req, timeout=30))
+                  lst = data.get('value', {}).get('list', [])
+                  if not lst:
+                      break
+                  for r in lst:
+                      res = r['lotteryDrawResult'].split()
+                      uns = r.get('lotteryUnsortDrawresult', '').split()
+                      front = res[:5]
+                      back = res[5:7]
+                      fd = (uns[:5] + [''] * 5)[:5]      # 前区出球顺序
+                      bd = (uns[5:7] + [''] * 2)[:2]     # 后区出球顺序
+                      pool = num(r.get('poolBalanceAfterdraw'))
+                      sale = num(r.get('totalSaleAmount'))
+                      pl = {p['prizeLevel']: p for p in r.get('prizeLevelList', [])}
+                      y1c, y1a = priz(pl, '一等奖')
+                      y2c, y2a = priz(pl, '二等奖')
+                      rows.append([r['lotteryDrawNum'], r['lotteryDrawTime']] + front + back + bd + fd +
+                                  [pool, sale, y1c, y1a, y2c, y2a])
+                  if len(lst) < 100:
+                      break
+                  page += 1
+              print('体彩官网抓取成功，共 %d 期' % len(rows))
+          except Exception as e:
+              print('体彩官网接口失败，回退 17500：', e)
+              import urllib.request as u
+              txt = u.urlopen('http://data.17500.cn/dlt_desc.txt', timeout=30).read().decode('utf-8')
+              for line in txt.strip().splitlines():
+                  t = line.split()
+                  if len(t) < 22:
+                      continue
+                  rows.append([x if x != '-' else '' for x in t[:22]])
+
+          with open('dlt.csv', 'w', newline='', encoding='utf-8') as f:
+              w = csv.writer(f)
+              w.writerow(['期号', '开奖日期', '前区1', '前区2', '前区3', '前区4', '前区5',
+                          '后区1', '后区2', '后区出球顺序1', '后区出球顺序2',
+                          '前区出球顺序1', '前区出球顺序2', '前区出球顺序3', '前区出球顺序4', '前区出球顺序5',
+                          '奖池余额', '本期销量', '一等奖注数', '一等奖单注奖金', '二等奖注数', '二等奖单注奖金'])
+              w.writerows(rows)
+          print('已写出 dlt.csv：%d 行' % len(rows))
+          PY
+
+      - name: 提交回 GitHub
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dlt.csv
+          git commit -m "auto: 更新大乐透数据" || echo "无变化，跳过"
+          git push
+
+      - name: 跨推到 Gitee（双备份）
+        if: ${{ env.GITEE_USER != '' }}
+        env:
+          GITEE_USER: ${{ secrets.GITEE_USER }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+        run: |
+          git remote add gitee https://${{ secrets.GITEE_TOKEN }}@gitee.com/${{ secrets.GITEE_USER }}/${{ secrets.GITEE_REPO }}.git
+          git push gitee HEAD:master --force
